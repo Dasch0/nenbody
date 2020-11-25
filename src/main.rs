@@ -1,4 +1,6 @@
+mod gfx;
 use bytemuck::{Pod, Zeroable};
+use cgmath::SquareMatrix;
 use cgmath::EuclideanSpace;
 use image::GenericImageView;
 use imgui::*;
@@ -13,30 +15,6 @@ use winit::{
     window::{Window, WindowBuilder},
 };
 
-pub struct Handle {
-    _instance: wgpu::Instance,
-    size: winit::dpi::PhysicalSize<u32>,
-    surface: wgpu::Surface,
-    _adapter: wgpu::Adapter,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-}
-
-pub struct UiState {
-    last_frame: std::time::Instant,
-    last_queue: u32,
-    show_demo: bool,
-    last_cursor: Option<imgui::MouseCursor>,
-    extent: wgpu::Extent3d,
-    camera_count: u32,
-    scene_camera: u32,
-    viewport_camera: u32,
-    viewport_scale: f32,
-    zoom: f32,
-    offset: [f32; 2],
-    texture_id: imgui::TextureId,
-}
-
 #[cfg_attr(rustfmt, rustfmt_skip)]
 #[allow(unused)]
 pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
@@ -46,27 +24,106 @@ pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
     0.0, 0.0, 0.5, 1.0,
 );
 
+/// Handle to core WGPU stuctures such as the device and queue
+pub struct GPU {
+    _instance: wgpu::Instance,
+    _adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+}
+impl GPU {
+    //TODO:: Support configurable features/limitations
+    /// Creates the GPU handle and returns the window surface used
+    async fn init(window: &Window) -> (GPU, wgpu::Surface) {
+        log::info!("Initializing instance...");
+        let _instance = wgpu::Instance::new(wgpu::BackendBit::PRIMARY);
+
+        log::info!("Obtaining window surface...");
+        let surface = unsafe {
+            _instance.create_surface(window)
+        };
+
+        log::info!("Initializing adapter...");
+        let _adapter = _instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::Default,
+                compatible_surface: Some(&surface),
+            })
+            .await
+            .unwrap();
+
+        let optional_features = wgpu::Features::empty();
+
+        // TODO: support for setups without unsized_binding_array
+        let required_features = wgpu::Features::default()
+            | wgpu::Features::PUSH_CONSTANTS
+            | wgpu::Features::UNSIZED_BINDING_ARRAY
+            | wgpu::Features::SAMPLED_TEXTURE_ARRAY_NON_UNIFORM_INDEXING
+            | wgpu::Features::SAMPLED_TEXTURE_BINDING_ARRAY;
+
+        let adapter_features = _adapter.features();
+
+        let required_limits = wgpu::Limits {
+            max_push_constant_size: std::mem::size_of::<PushConstant>() as u32,
+            ..wgpu::Limits::default()
+        };
+
+        let trace_dir = std::env::var("WGPU_TRACE");
+
+        log::info!("Initializing device & queue...");
+        let (device, queue) = _adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    features: (adapter_features & optional_features) | required_features,
+                    limits: required_limits,
+                    shader_validation: true,
+                },
+                trace_dir.ok().as_ref().map(std::path::Path::new),
+            )
+            .await
+            .unwrap();
+        log::info!("Setup complete!");
+
+        (GPU {
+            _instance,
+            _adapter,
+            device,
+            queue,
+        },
+        surface)
+    }
+   
+    /// Wraps the async init function with blocking call
+    fn new(window: &Window) -> (GPU, wgpu::Surface) {
+        futures::executor::block_on(GPU::init(window))
+    }
+   
+    /// Wraps the async init function with a blocking call
+    /// Wraps the GPU handle in ARC
+    fn new_with_arc(window: &Window) -> (Arc<GPU>, wgpu::Surface) {
+        let (gpu, surface) = futures::executor::block_on(GPU::init(window));
+        (Arc::new(gpu), surface)
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct Vertex {
     _pos: [f32; 4],
     _tex_coord: [f32; 2],
 }
-
-fn vertex(pos: [i8; 3], tc: [i8; 2]) -> Vertex {
-    Vertex {
-        _pos: [pos[0] as f32, pos[1] as f32, pos[2] as f32, 1.0],
-        _tex_coord: [tc[0] as f32, tc[1] as f32],
+impl Vertex {
+    fn new(pos: [i8; 3], tc: [i8; 2]) -> Vertex {
+        Vertex {
+            _pos: [pos[0] as f32, pos[1] as f32, pos[2] as f32, 1.0],
+            _tex_coord: [tc[0] as f32, tc[1] as f32],
+        }
     }
-}
-
-fn rotation_of(v: &cgmath::Vector3<f32>) -> cgmath::Rad<f32> {
-    cgmath::Angle::atan2(v.y, v.x)
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct PushConstant {
+pub struct PushConstant {
     eye_index: u32,
     _pad: u32,
 }
@@ -77,7 +134,7 @@ impl PushConstant {
 }
 
 #[derive(Debug)]
-struct BufferDimensions {
+pub struct BufferDimensions {
     _width: usize,
     height: usize,
     depth: usize,
@@ -104,132 +161,214 @@ impl BufferDimensions {
     }
 }
 
+/// A render target is a multisampled texture that may be rendered to and copied to
+/// A view is created for each layer of the texture (extent.depth). This allows for rendering to
+/// each layer
+/// For display-able and copy-able targets, see ResolveTarget
+// TODO: Handle invalid sample counts 
+#[derive(Debug)]
+pub struct RenderTarget {
+    extent: wgpu::Extent3d,
+    format: wgpu::TextureFormat,
+    samples: usize,
+    texture: wgpu::Texture,
+    views: Vec<wgpu::TextureView>,
+}
+
+impl RenderTarget {
+    fn new(device: &wgpu::Device, extent: wgpu::Extent3d, format: wgpu::TextureFormat, samples: usize) -> RenderTarget{ 
+        let texture: wgpu::Texture = device.create_texture(&wgpu::TextureDescriptor {
+            size: extent,
+            mip_level_count: 1,
+            sample_count: samples as u32,
+            dimension: match extent.depth {
+                1 => wgpu::TextureDimension::D2,
+                // TODO: Should multi-layer textures always be D3?
+                _ => wgpu::TextureDimension::D2,
+            },
+            format,
+            usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT | wgpu::TextureUsage::COPY_SRC,
+            label: None,
+        });
+
+        // Create views for each layer of texture
+        let views: Vec<wgpu::TextureView> = 
+            (0..extent.depth)
+                .into_iter()
+                .map(|i| {
+                    texture.create_view(&wgpu::TextureViewDescriptor {
+                        label: None,
+                        format: Some(format),
+                        dimension: Some(wgpu::TextureViewDimension::D2),
+                        aspect: wgpu::TextureAspect::All,
+                        base_mip_level: 0,
+                        level_count: None,
+                        base_array_layer: i,
+                        array_layer_count: std::num::NonZeroU32::new(1),
+                    })
+                })
+                .collect();
+
+        RenderTarget {
+            extent,
+            format,
+            samples,
+            texture,
+            views,
+        }
+    }
+
+    /// Returns a new RenderTarget object resized to the provided extent
+    fn resize(&mut self, device: &wgpu::Device, extent: wgpu::Extent3d) { 
+       *self = RenderTarget::new(device, extent, self.format, self.samples);
+    }
+}
+
+pub struct ResolveTarget {
+    extent: wgpu::Extent3d,
+    format: wgpu::TextureFormat,
+    texture: wgpu::Texture,
+    views: Vec<wgpu::TextureView>,
+}
+impl ResolveTarget {
+    fn from_render_target(device: &wgpu::Device, target: &RenderTarget) -> ResolveTarget{
+        let texture: wgpu::Texture = device.create_texture(&wgpu::TextureDescriptor {
+            size: target.extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: match target.extent.depth {
+                1 => wgpu::TextureDimension::D2,
+                // TODO: Should multi-layer textures always be D3?
+                _ => wgpu::TextureDimension::D2,
+            },
+            format: target.format,
+            usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT | wgpu::TextureUsage::COPY_SRC,
+            label: None,
+        });
+
+        // Create views for each layer of texture
+        let views: Vec<wgpu::TextureView> = 
+            (0..target.extent.depth)
+                .into_iter()
+                .map(|i| {
+                    texture.create_view(&wgpu::TextureViewDescriptor {
+                        label: None,
+                        format: Some(target.format),
+                        dimension: Some(wgpu::TextureViewDimension::D2),
+                        aspect: wgpu::TextureAspect::All,
+                        base_mip_level: 0,
+                        level_count: None,
+                        base_array_layer: i,
+                        array_layer_count: std::num::NonZeroU32::new(1),
+                    })
+                })
+                .collect();
+
+        ResolveTarget {
+            extent: target.extent,
+            format: target.format,
+            texture,
+            views,
+        }
+    }
+}
+
+/// Array of cameras with a shared normal
+/// Since the normal is fixed, this is only supports single axis rotations
+pub struct CameraArray {
+    count: usize,
+    vertical_fov: cgmath::Deg<f32>,
+    aspect_ratio: f32,
+    normal: cgmath::Vector3<f32>,
+    buf: wgpu::Buffer,
+    mat: Vec<[[f32; 4]; 4]>,
+}
+impl CameraArray {
+    fn build_camera(
+        aspect_ratio: f32,
+        eye: cgmath::Point3<f32>,
+        center: cgmath::Vector3<f32>,
+        up: cgmath::Vector3<f32>,
+        vertical_fov: cgmath::Deg<f32>,
+    ) -> [[f32; 4]; 4] {
+        let proj = cgmath::perspective(vertical_fov, aspect_ratio, 1.0, 1000.0);
+        let view = cgmath::Matrix4::look_at_dir(eye, center, up);
+        let correction = OPENGL_TO_WGPU_MATRIX;
+        (correction * proj * view).into()
+    }
+
+    /// Create a new camera array, matrices are uninitialized
+    fn new(
+        device: &wgpu::Device,
+        count: usize,
+        extent: wgpu::Extent3d,
+        horizontal_fov: cgmath::Deg<f32>,
+        normal: cgmath::Vector3<f32>,
+    ) -> CameraArray {
+        let aspect_ratio = extent.width as f32 / extent.height as f32;
+        let mat : Vec<[[f32; 4]; 4]> = vec![cgmath::Matrix4::identity().into(); count];
+        CameraArray {
+            count,
+            vertical_fov: horizontal_fov / aspect_ratio,
+            aspect_ratio, 
+            normal,
+            buf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&mat),
+                usage: wgpu::BufferUsage::STORAGE | wgpu::BufferUsage::COPY_DST,
+            }),
+            mat, 
+        }
+    }
+
+    /// Update camera matrices. Eyes are the positions of each eye, and look_dirs is a vector
+    /// pointing in the desired look direction. Requires a mutable camera array
+    fn update(
+        &mut self,
+        eyes: &Vec<cgmath::Point3<f32>>,
+        look_dirs: &Vec<cgmath::Vector3<f32>>,
+    ) {
+        let aspect_ratio = self.aspect_ratio;
+        let normal = self.normal;
+        let fov = self.vertical_fov;
+        self.mat.par_iter_mut().for_each(|m| {
+            *m = CameraArray::build_camera(
+                aspect_ratio,
+                eyes[0],
+                look_dirs[0],
+                normal,
+                fov,
+            );
+        });
+    }
+
+    /// Resizes camera array, maintaining horizontal fov. Note that changes will not take affect until the next update
+    fn resize(&mut self, extent: wgpu::Extent3d) {
+        // maintain the previous horizontal field of view 
+        let horizontal_fov = self.vertical_fov * self.aspect_ratio;
+        self.aspect_ratio = extent.width as f32 / extent.height as f32;
+        self.vertical_fov = horizontal_fov / self.aspect_ratio;
+    }
+
+    /// Writes the current camera matrices to the GPU
+    fn write(&self, queue: &wgpu::Queue) {
+        queue.write_buffer(&self.buf, 0, bytemuck::cast_slice(&self.mat));
+    }
+}
+
+fn rotation_of(v: &cgmath::Vector3<f32>) -> cgmath::Rad<f32> {
+    cgmath::Angle::atan2(v.y, v.x)
+}
+
 fn init_geometry_data() -> (Vec<Vertex>, Vec<u16>) {
     let vertex_data = [
-        vertex([-1, -1, 0], [0, 0]),
-        vertex([1, 0, 0], [0, 1]),
-        vertex([-1, 1, 0], [1, 1]),
+        Vertex::new([-1, -1, 0], [0, 0]),
+        Vertex::new([1, 0, 0], [0, 1]),
+        Vertex::new([-1, 1, 0], [1, 1]),
     ];
 
     let index_data = [0, 1, 2, 0];
     (vertex_data.to_vec(), index_data.to_vec())
-}
-
-async fn init_gpu(window: &Window) -> Arc<Handle> {
-    log::info!("Initializing instance...");
-    let _instance = wgpu::Instance::new(wgpu::BackendBit::PRIMARY);
-
-    log::info!("Obtaining window surface...");
-    let (size, surface) = unsafe {
-        let size = window.inner_size();
-        let surface = _instance.create_surface(window);
-        (size, surface)
-    };
-
-    log::info!("Initializing adapter...");
-    let _adapter = _instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::Default,
-            compatible_surface: Some(&surface),
-        })
-        .await
-        .unwrap();
-
-    let optional_features = wgpu::Features::empty();
-
-    // TODO: support for setups without unsized_binding_array
-    let required_features = wgpu::Features::default()
-        | wgpu::Features::PUSH_CONSTANTS
-        | wgpu::Features::UNSIZED_BINDING_ARRAY
-        | wgpu::Features::SAMPLED_TEXTURE_ARRAY_NON_UNIFORM_INDEXING
-        | wgpu::Features::SAMPLED_TEXTURE_BINDING_ARRAY;
-
-    let adapter_features = _adapter.features();
-
-    let required_limits = wgpu::Limits {
-        max_push_constant_size: std::mem::size_of::<PushConstant>() as u32,
-        ..wgpu::Limits::default()
-    };
-
-    let trace_dir = std::env::var("WGPU_TRACE");
-
-    log::info!("Initializing device & queue...");
-    let (device, queue) = _adapter
-        .request_device(
-            &wgpu::DeviceDescriptor {
-                features: (adapter_features & optional_features) | required_features,
-                limits: required_limits,
-                shader_validation: true,
-            },
-            trace_dir.ok().as_ref().map(std::path::Path::new),
-        )
-        .await
-        .unwrap();
-    log::info!("Setup complete!");
-
-    Arc::new(Handle {
-        _instance,
-        size,
-        surface,
-        _adapter,
-        device,
-        queue,
-    })
-}
-
-fn build_swapchain(
-    device: &wgpu::Device,
-    surface: &wgpu::Surface,
-    size: winit::dpi::PhysicalSize<u32>,
-) -> (wgpu::SwapChainDescriptor, wgpu::SwapChain) {
-    log::info!("Initializing swapchain...");
-    let swapchain_desc = wgpu::SwapChainDescriptor {
-        usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT,
-        format: wgpu::TextureFormat::Bgra8UnormSrgb,
-        width: size.width,
-        height: size.height,
-        present_mode: wgpu::PresentMode::Immediate,
-    };
-    let swapchain = device.create_swap_chain(surface, &swapchain_desc);
-    (swapchain_desc, swapchain)
-}
-
-fn init_texture_array(
-    device: &wgpu::Device,
-    extent: wgpu::Extent3d,
-    format: wgpu::TextureFormat,
-    msaa_samples: usize,
-) -> (wgpu::Texture, Arc<Vec<wgpu::TextureView>>) {
-    // Create MSAA textures
-    let texture: wgpu::Texture = device.create_texture(&wgpu::TextureDescriptor {
-        size: extent,
-        mip_level_count: 1,
-        sample_count: msaa_samples as u32,
-        dimension: wgpu::TextureDimension::D2,
-        format: format,
-        usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT | wgpu::TextureUsage::COPY_SRC,
-        label: None,
-    });
-
-    // Create views for each layer of texture
-    let views: Arc<Vec<wgpu::TextureView>> = Arc::new(
-        (0..extent.depth)
-            .into_par_iter()
-            .map(|i| {
-                texture.create_view(&wgpu::TextureViewDescriptor {
-                    label: None,
-                    format: Some(format),
-                    dimension: Some(wgpu::TextureViewDimension::D2),
-                    aspect: wgpu::TextureAspect::All,
-                    base_mip_level: 0,
-                    level_count: None,
-                    base_array_layer: 1,
-                    array_layer_count: std::num::NonZeroU32::new(i),
-                })
-            })
-            .collect(),
-    );
-    (texture, views)
 }
 
 fn init_scene_config(
@@ -357,69 +496,15 @@ fn init_scene_config(
     )
 }
 
-fn init_capture(
-    device: &wgpu::Device,
-    extent: wgpu::Extent3d,
-) -> (
-    wgpu::Texture,
-    Vec<wgpu::TextureView>,
-    BufferDimensions,
-    wgpu::Buffer,
-) {
-    // Capture Texture & Buffer
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        size: extent,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Bgra8UnormSrgb,
-        usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT | wgpu::TextureUsage::COPY_SRC,
-        label: Some(&format!("Capture texture")),
-    });
-
-    // Create views for each layer of texture
-    let views: Vec<wgpu::TextureView> = (0..extent.depth)
-        .into_par_iter()
-        .map(|i| {
-            texture.create_view(&wgpu::TextureViewDescriptor {
-                label: None,
-                format: Some(wgpu::TextureFormat::Bgra8UnormSrgb),
-                dimension: Some(wgpu::TextureViewDimension::D2),
-                aspect: wgpu::TextureAspect::All,
-                base_mip_level: 0,
-                level_count: None,
-                base_array_layer: i,
-                array_layer_count: std::num::NonZeroU32::new(1),
-            })
-        })
-        .collect();
-
-    let dimension = BufferDimensions::new(
-        extent.width as usize,
-        extent.height as usize,
-        extent.depth as usize,
-    );
-
-    log::info!("capture buffer dimension: {:#?}", dimension);
-
-    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Capture Buffer"),
-        size: 4* (dimension.padded_bytes_per_row * dimension.height * dimension.depth) as u64,
-        usage: wgpu::BufferUsage::MAP_READ | wgpu::BufferUsage::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    (texture, views, dimension, buffer)
-}
-
 fn init_scene_data(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    entity_count: usize,
 ) -> (
     Arc<wgpu::Buffer>,
     Arc<wgpu::Buffer>,
     usize,
-    Arc<RwLock<Vec<[[f32; 4]; 4]>>>,
+    Vec<[[f32; 4]; 4]>,
     wgpu::Buffer,
     wgpu::Extent3d,
     wgpu::Texture,
@@ -443,20 +528,19 @@ fn init_scene_data(
 
     let mut rng = rand::thread_rng();
     // TODO: allow for different instance counts
-    let instance_data: Arc<RwLock<Vec<[[f32; 4]; 4]>>> = Arc::new(RwLock::new(
-        (0..2000)
+    let instance_data: Vec<[[f32; 4]; 4]> =
+        (0..entity_count)
             .map(|_| {
                 cgmath::Matrix4::<f32>::from_translation(
                     [rng.gen_range(-1.0, 1.0), rng.gen_range(-1.0, 1.0), 0.0].into(),
                 )
                 .into()
             })
-            .collect(),
-    ));
+            .collect();
 
     let instance_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Instance Buffer"),
-        contents: bytemuck::cast_slice(instance_data.read().unwrap().as_ref()),
+        contents: bytemuck::cast_slice(instance_data.as_ref()),
         usage: wgpu::BufferUsage::STORAGE | wgpu::BufferUsage::COPY_DST,
     });
 
@@ -517,6 +601,21 @@ fn init_scene_data(
         skin_view,
         sampler,
     )
+}
+
+pub struct UiState {
+    last_frame: std::time::Instant,
+    last_queue: u32,
+    show_demo: bool,
+    last_cursor: Option<imgui::MouseCursor>,
+    extent: wgpu::Extent3d,
+    camera_count: u32,
+    scene_camera: u32,
+    viewport_camera: u32,
+    viewport_scale: f32,
+    zoom: f32,
+    offset: [f32; 2],
+    texture_id: imgui::TextureId,
 }
 
 fn init_imgui(
@@ -649,28 +748,6 @@ fn imgui_build_ui(ui: &imgui::Ui, state: &mut UiState) {
     }
 }
 
-fn imgui_resize_texture(
-    device: &wgpu::Device,
-    imgui_renderer: &mut imgui_wgpu::Renderer,
-    extent: wgpu::Extent3d,
-    imgui_texture_id: imgui::TextureId,
-) {
-    // Create imgui texture for drawing rendered textures in UI
-    let imgui_texture_config = imgui_wgpu::TextureConfig::new(extent.width, extent.height)
-        .set_usage(
-            wgpu::TextureUsage::COPY_SRC
-                | wgpu::TextureUsage::COPY_DST
-                | wgpu::TextureUsage::SAMPLED
-                | wgpu::TextureUsage::OUTPUT_ATTACHMENT,
-        );
-
-    let imgui_texture = imgui_wgpu::Texture::new(device, imgui_renderer, imgui_texture_config);
-    imgui_renderer
-        .textures
-        .replace(imgui_texture_id, imgui_texture)
-        .expect("invalid imgui_texture_id");
-}
-// dedicated to SAMI!
 fn imgui_draw_ui(
     platform: &mut imgui_winit_support::WinitPlatform,
     window: &winit::window::Window,
@@ -708,74 +785,6 @@ fn imgui_draw_ui(
     queue.submit(Some(encoder.finish()));
 }
 
-fn build_camera(
-    aspect_ratio: f32,
-    eye: cgmath::Point3<f32>,
-    center: cgmath::Point3<f32>,
-    up: cgmath::Vector3<f32>,
-    fov: cgmath::Deg<f32>,
-) -> [[f32; 4]; 4] {
-    let proj = cgmath::perspective(fov, aspect_ratio, 1.0, 1000.0);
-    let view = cgmath::Matrix4::look_at(eye, center, up);
-    let correction = OPENGL_TO_WGPU_MATRIX;
-    (correction * proj * view).into()
-}
-
-fn init_camera_list(
-    device: &wgpu::Device,
-    extent: wgpu::Extent3d,
-    eye_list: &Vec<cgmath::Point3<f32>>,
-    center_list: &Vec<cgmath::Vector3<f32>>,
-    normal: cgmath::Vector3<f32>,
-    fov: cgmath::Deg<f32>,
-) -> (Vec<[[f32; 4]; 4]>, wgpu::Buffer) {
-    log::info!("Creating Cameras...");
-    let camera_list: Vec<[[f32; 4]; 4]> = (0..eye_list.len())
-        .into_par_iter()
-        .map(|i| {
-            build_camera(
-                extent.width as f32 / extent.height as f32,
-                eye_list[i],
-                cgmath::EuclideanSpace::from_vec(center_list[i]),
-                normal,
-                fov,
-            )
-        })
-        .collect();
-
-    let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: None,
-        contents: bytemuck::cast_slice(&camera_list),
-        usage: wgpu::BufferUsage::STORAGE | wgpu::BufferUsage::COPY_DST,
-    });
-    (camera_list, camera_buf)
-}
-
-// TODO: support camera rotations
-fn update_camera_list(
-    queue: &wgpu::Queue,
-    camera_list: &mut Vec<[[f32; 4]; 4]>,
-    camera_buf: &wgpu::Buffer,
-    extent: wgpu::Extent3d,
-    eye_list: &Vec<cgmath::Point3<f32>>,
-    center_list: &Vec<cgmath::Vector3<f32>>,
-    normal: cgmath::Vector3<f32>,
-    fov: cgmath::Deg<f32>,
-) {
-    *camera_list = (0..eye_list.len())
-        .into_par_iter()
-        .map(|i| {
-            build_camera(
-                extent.width as f32 / extent.height as f32,
-                eye_list[i],
-                cgmath::EuclideanSpace::from_vec(center_list[i]),
-                normal,
-                fov,
-            )
-        })
-        .collect();
-    queue.write_buffer(&camera_buf, 0, bytemuck::cast_slice(camera_list.as_ref()));
-}
 
 fn render<T: Pod>(
     msaa_target: &wgpu::TextureView,
@@ -843,7 +852,7 @@ fn build_command_buffer_parallel(
     let span = msaa_target_list.len() / GRANULARITY;
 
     cmd_buf_list
-        .into_iter()
+        .into_par_iter()
         .enumerate()
         .for_each(|(m, cmd_buf)| {
             let mut encoder =
@@ -882,189 +891,101 @@ fn build_command_buffer_parallel(
         });
 }
 
-fn build_command_buffer(
-    msaa_target_list: &Vec<wgpu::TextureView>,
-    resolve_target_list: &Vec<wgpu::TextureView>,
-    device: &wgpu::Device,
-    _queue: &wgpu::Queue,
-    pipeline: &wgpu::RenderPipeline,
-    bind_group: &wgpu::BindGroup,
-    vertex_buf: &wgpu::Buffer,
-    index_buf: &wgpu::Buffer,
-    index_cnt: usize,
-    instance_cnt: usize,
-) -> wgpu::CommandBuffer {
-    let mut encoder =
-        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-    (0..msaa_target_list.len()).for_each(|i| {
-        let mut renderpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            color_attachments: &[wgpu::RenderPassColorAttachmentDescriptor {
-                attachment: &msaa_target_list[i],
-                resolve_target: Some(&resolve_target_list[i]),
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.1,
-                        g: 0.2,
-                        b: 0.3,
-                        a: 1.0,
-                    }),
-                    store: true,
-                },
-            }],
-            depth_stencil_attachment: None,
-        });
-        renderpass.set_pipeline(&pipeline);
-        renderpass.set_bind_group(0, &bind_group, &[]);
-        renderpass.set_index_buffer(index_buf.slice(..));
-        renderpass.set_vertex_buffer(0, vertex_buf.slice(..));
-        renderpass.set_push_constants(
-            wgpu::ShaderStage::VERTEX | wgpu::ShaderStage::FRAGMENT,
-            0,
-            bytemuck::cast_slice(&[PushConstant::new(i as u32)]),
-        );
-        renderpass.draw_indexed(0..index_cnt as u32, 0, 0..instance_cnt as u32);
-        drop(renderpass);
-    });
-    encoder.finish()
-}
-
-fn capture(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    src_texture: &wgpu::Texture,
-    extent: wgpu::Extent3d,
-    dst_buffer: &wgpu::Buffer,
-    buffer_dimension: &BufferDimensions,
-) {
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("Capture Command"),
-    });
-
-    encoder.copy_texture_to_buffer(
-        wgpu::TextureCopyView {
-            texture: src_texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-        },
-        wgpu::BufferCopyView {
-            buffer: &dst_buffer,
-            layout: wgpu::TextureDataLayout {
-                offset: 0,
-                bytes_per_row: buffer_dimension.padded_bytes_per_row as u32,
-                rows_per_image: extent.height,
-            },
-        },
-        wgpu::Extent3d {
-            width: extent.width,
-            height: extent.height,
-            depth: extent.depth - 1,
-        },
-    );
-    let command_buffer = encoder.finish();
-    queue.submit(Some(command_buffer));
-}
-
 fn main() {
-    // Init Window
+    // Placeholder Constants
+    // TODO: Get max allowed msaa_samples and store in GPU handle
+    let msaa_samples = 8;
+    // TODO: Support entity counts higher than 2048
+    let entity_count = 2;
+
+    // Window
     env_logger::init();
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new().build(&event_loop).unwrap();
 
-    // Constants
-    let msaa_samples = 8;
-
-    // Device, Queue, Surface
-    let h = futures::executor::block_on(init_gpu(&window));
-
-    let (
-        vertex_buf,
-        index_buf,
-        index_count,
-        instance_data,
-        instance_buf,
-        _texture_extent,
-        _texture,
-        texture_view,
-        texture_sampler,
-    ) = init_scene_data(&h.device, &h.queue);
+    // GPU and surface 
+    let (gpu, surface) = GPU::new(&window);
 
     // Swapchain
-    let (swapchain_desc, mut swapchain) = build_swapchain(&h.device, &h.surface, h.size);
+    let mut swapchain_desc = wgpu::SwapChainDescriptor {
+        usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT,
+        format: wgpu::TextureFormat::Bgra8UnormSrgb,
+        width: window.inner_size().width,
+        height: window.inner_size().height,
+        present_mode: wgpu::PresentMode::Immediate,
+    };
+    let mut swapchain = gpu.device.create_swap_chain(&surface, &swapchain_desc);
+    
     let swapchain_extent = wgpu::Extent3d {
         width: swapchain_desc.width,
         height: swapchain_desc.height,
         depth: 1,
     };
 
+    // Render Targets
+    // scene (resolved to swapchain image)
+    let mut display = RenderTarget::new(&gpu.device,
+                                  swapchain_extent,
+                                  swapchain_desc.format,
+                                  msaa_samples);
+
+    // eyes (resolved to resolved_eyes) 
     let eye_extent = wgpu::Extent3d {
         width: 1024,
         height: 1,
-        depth: instance_data.read().unwrap().len() as u32,
+        depth: entity_count as u32,
     };
-
-    // Render Targets
-    // scene msaa target
-    let mut _scene_msaa_texture = h.device.create_texture(&wgpu::TextureDescriptor {
-        label: None,
-        size: swapchain_extent,
-        mip_level_count: 1,
-        sample_count: msaa_samples,
-        dimension: wgpu::TextureDimension::D2,
-        format: swapchain_desc.format,
-        usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT | wgpu::TextureUsage::COPY_SRC,
-    });
-
-    let mut scene_msaa_view =
-        _scene_msaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-    // eye msaa target
-    let (_eye_texture, eye_views) = init_texture_array(
-        &h.device,
-        eye_extent,
-        swapchain_desc.format,
-        msaa_samples as usize,
-    );
-
-    // eye resolve targets
-    let (capture_texture, capture_views, capture_dimension, capture_buffer) =
-        init_capture(&h.device, eye_extent);
-
-    // viewport msaa target
-    let viewport_texture = h.device.create_texture(&wgpu::TextureDescriptor {
-        size: wgpu::Extent3d {
-            width: eye_extent.width,
-            height: eye_extent.height,
-            depth: 1,
-        },
-        mip_level_count: 1,
-        sample_count: msaa_samples,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Bgra8UnormSrgb,
-        usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT | wgpu::TextureUsage::COPY_SRC,
-        label: Some(&format!("Capture texture")),
-    });
-
-    // Create views for each layer of texture
-    let viewport_view = viewport_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
+    let eyes = RenderTarget::new(&gpu.device,
+                                 eye_extent,
+                                 swapchain_desc.format, // TODO: Consider other formats?
+                                 msaa_samples);
+    let resolved_eyes = ResolveTarget::from_render_target(&gpu.device, &eyes);
+    
+    // viewport (resolved to imgui viewport)
+    let viewport_extent = wgpu::Extent3d {
+        width: eye_extent.width,
+        height: eye_extent.height,
+        depth: 1, // Viewport is one layer of eye
+    };
+    let viewport = RenderTarget::new(&gpu.device,
+                                     viewport_extent,
+                                     eyes.format, // Format should match eye
+                                     msaa_samples);
+    
+    // Scene
+    let (
+        vertex_buf,
+        index_buf,
+        index_count,
+        mut instance_data,
+        instance_buf,
+        _texture_extent,
+        _texture,
+        texture_view,
+        texture_sampler,
+    ) = init_scene_data(&gpu.device, &gpu.queue, entity_count);
+                                     
     // UI
-    let (mut imgui_context, mut imgui_platform, mut imgui_renderer, imgui_texture_id) = init_imgui(
+    let (mut imgui_context,
+         mut imgui_platform,
+         mut imgui_renderer,
+         imgui_texture_id) = init_imgui(
         &window,
-        &h.device,
-        &h.queue,
+        &gpu.device,
+        &gpu.queue,
         swapchain_desc.format,
         eye_extent,
     );
 
     // Scene Config
     let (bind_group_layout, _pipeline_layout, pipeline) =
-        init_scene_config(&h.device, swapchain_desc.format, msaa_samples as usize);
+        init_scene_config(&gpu.device, swapchain_desc.format, msaa_samples as usize);
 
-    // Placeholder entity data
+    // Placeholder position and velocity generation
     let mut rng = rand::thread_rng();
     let mut velocities: Vec<cgmath::Vector3<f32>> =
-        vec![cgmath::Vector3::<f32>::new(0.0, 0.0, 0.0); instance_data.read().unwrap().len()];
-    let mut positions: Vec<cgmath::Point3<f32>> = (0..instance_data.read().unwrap().len())
+        vec![cgmath::Vector3::<f32>::new(0.0, 0.0, 0.0); instance_data.len()];
+    let mut positions: Vec<cgmath::Point3<f32>> = (0..instance_data.len())
         .map(|_| {
             cgmath::Point3::<f32>::new(rng.gen_range(-1.0, 1.0), rng.gen_range(-1.0, 1.0), 0.0)
         })
@@ -1073,34 +994,28 @@ fn main() {
     // Cameras
     // scene_camera
     let mut scene_position = vec![cgmath::Point3::<f32>::new(0.0, 0.0, 100.0); 1];
-    let mut scene_center = vec![cgmath::Vector3::<f32>::new(0.0, 0.0, 0.0); 1];
-
-    let (mut scene_camera, scene_camera_buffer) = init_camera_list(
-        &h.device,
-        swapchain_extent,
-        &scene_position,
-        &scene_center,
-        cgmath::Vector3::unit_x(),
-        cgmath::Deg(90f32),
-    );
+    let scene_look_dir = vec![-cgmath::Vector3::unit_z(); 1];
+    let mut scene_cam = CameraArray::new(&gpu.device,
+                                        1,
+                                        swapchain_extent,
+                                        cgmath::Deg(90.0),
+                                        cgmath::Vector3::unit_x());
 
     // eye cameras
-    let (mut camera_list, camera_buf) = init_camera_list(
-        &h.device,
-        eye_extent,
-        &positions,
-        &velocities,
-        cgmath::Vector3::unit_z(),
-        cgmath::Deg(0.1f32),
-    );
+    let mut eye_cams = CameraArray::new(&gpu.device,
+                                   entity_count,
+                                   eye_extent,
+                                   cgmath::Deg(90.0),
+                                   cgmath::Vector3::unit_z());
+
 
     log::info!("Creating bind groups...");
-    let scene_bind_group = h.device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let scene_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
         layout: &bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::Buffer(scene_camera_buffer.slice(..)),
+                resource: wgpu::BindingResource::Buffer(scene_cam.buf.slice(..)),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -1118,12 +1033,12 @@ fn main() {
         label: Some("Scene Bind Group"),
     });
 
-    let eye_bind_group = h.device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let eye_bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
         layout: &bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::Buffer(camera_buf.slice(..)),
+                resource: wgpu::BindingResource::Buffer(eye_cams.buf.slice(..)),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -1148,7 +1063,7 @@ fn main() {
         show_demo: false,
         last_cursor: None,
         extent: swapchain_extent,
-        camera_count: instance_data.read().unwrap().len() as u32,
+        camera_count: instance_data.len() as u32,
         scene_camera: 0,
         viewport_camera: 1,
         viewport_scale: 0.15,
@@ -1156,288 +1071,227 @@ fn main() {
         offset: [0.0, 0.0],
         texture_id: imgui_texture_id,
     };
-    drop(swapchain_extent);
 
-    let instance_data_clone = instance_data.clone();
-    let h_clone = h.clone();
-
+    // Command buffer list 
     let mut cmd_buf_list: Vec<wgpu::CommandBuffer> = Vec::with_capacity(GRANULARITY);
+
+    log::info!("Prearing event loop actions");
+
     log::info!("Starting event loop!");
 
     let mut last_update_inst = std::time::Instant::now();
-    crossbeam::thread::scope(|s| {
-        s.spawn(|_| {
-            loop {
-                // Update entities
-                {
-                    let inst = &mut *instance_data_clone.write().unwrap();
-                    inst.into_par_iter()
-                        .zip(&mut velocities)
-                        .zip(&mut positions[..])
-                        .for_each(|((mat, vel), pos)| {
-                            let mut rng = rand::thread_rng();
-                            *vel += cgmath::Vector3::<f32>::new(
-                                rng.gen_range(-0.0001, 0.0001),
-                                rng.gen_range(-0.0001, 0.0001),
-                                0.0,
-                            );
-                            *pos += *vel;
-                            *mat = (
-                                cgmath::Matrix4::<f32>::from_translation(
-                                    pos.to_vec(),
-                                ) * cgmath::Matrix4::from_angle_z(
-                                    rotation_of(vel),
-                                )).into();
-                        });
-                    h_clone.queue.write_buffer(
-                        &instance_buf,
-                        0,
-                        bytemuck::cast_slice(inst.as_ref()),
-                    );
-                    // Update cameras
-                    update_camera_list(
-                        &h_clone.queue,
-                        &mut camera_list,
-                        &camera_buf,
-                        eye_extent,
-                        &positions,
-                        &velocities,
-                        cgmath::Vector3::unit_z(),
-                        cgmath::Deg(0.1f32),
-                    );
+    event_loop.run(move |event, _, control_flow| {
+        
+        // Set control flow to wait min(next event, 10ms)
+        *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(1));
+
+        // Process events
+        match event {
+            Event::MainEventsCleared => {
+                if last_update_inst.elapsed() > Duration::from_millis(2) {
+                    window.request_redraw();
+                    last_update_inst = Instant::now();
                 }
-                std::thread::sleep(std::time::Duration::new(0, 1000));
-
-            }
-        });
-
-        event_loop.run(move |event, _, control_flow| {
-            // Set control flow to wait min(next event, 10ms)
-            *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(10));
-
-            // Process events
-            match event {
-                Event::MainEventsCleared => {
-                    if last_update_inst.elapsed() > Duration::from_millis(20) {
-                        window.request_redraw();
-                        last_update_inst = Instant::now();
-                    }
-                }
-                Event::WindowEvent {
-                    event: WindowEvent::Resized(_),
+            },
+            Event::WindowEvent {event: WindowEvent::Resized(_), ..} => {
+                let size = window.inner_size();
+                // store new extent to ui_state
+                ui_state.extent = wgpu::Extent3d {
+                    width: size.width,
+                    height: size.height,
+                    depth: 1,
+                };
+                log::info!("Resizing to {:?}", size);
+                // resize swapchain 
+                swapchain_desc.width = size.width;
+                swapchain_desc.height = size.height;
+                swapchain = gpu.device.create_swap_chain(&surface, &swapchain_desc);
+                // resize scene 
+                scene_cam.resize(ui_state.extent);
+                display.resize(&gpu.device, ui_state.extent);
+            },
+            
+            Event::WindowEvent { ref event, .. } => match event {
+                WindowEvent::KeyboardInput {
+                    input:
+                        KeyboardInput {
+                            virtual_keycode: Some(virtual_code),
+                            state: ElementState::Pressed,
+                            ..
+                        },
                     ..
-                } => {
-                    let size = window.inner_size();
-                    ui_state.extent = wgpu::Extent3d {
-                        width: size.width,
-                        height: size.height,
-                        depth: 1,
-                    };
-
-                    log::info!("Resizing to {:?}", size);
-
-                    // Swapchain
-                    build_swapchain(&h.device, &h.surface, size);
-
-                    update_camera_list(
-                        &h.queue,
-                        &mut scene_camera,
-                        &scene_camera_buffer,
-                        ui_state.extent,
-                        &scene_position,
-                        &scene_center,
-                        cgmath::Vector3::unit_x(),
-                        cgmath::Deg(90f32),
-                    );
-
-                    // scene msaa target
-                    _scene_msaa_texture = h.device.create_texture(&wgpu::TextureDescriptor {
-                        label: None,
-                        size: ui_state.extent,
-                        mip_level_count: 1,
-                        sample_count: msaa_samples,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: swapchain_desc.format,
-                        usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT
-                            | wgpu::TextureUsage::COPY_SRC,
-                    });
-
-                    scene_msaa_view =
-                        _scene_msaa_texture.create_view(&wgpu::TextureViewDescriptor::default());
-                }
-
-                Event::WindowEvent { ref event, .. } => match event {
-                    WindowEvent::KeyboardInput {
-                        input:
-                            KeyboardInput {
-                                virtual_keycode: Some(virtual_code),
-                                state: ElementState::Pressed,
-                                ..
-                            },
-                        ..
-                    } => match virtual_code {
-                        VirtualKeyCode::W => {
-                            scene_position[ui_state.scene_camera as usize] +=
-                                cgmath::Vector3::unit_x();
-                            scene_center[ui_state.scene_camera as usize] +=
-                                cgmath::Vector3::unit_x();
-                        }
-                        VirtualKeyCode::S => {
-                            scene_position[ui_state.scene_camera as usize] -=
-                                cgmath::Vector3::unit_x();
-                            scene_center[ui_state.scene_camera as usize] -=
-                                cgmath::Vector3::unit_x();
-                        }
-                        VirtualKeyCode::A => {
-                            scene_position[ui_state.scene_camera as usize] -=
-                                cgmath::Vector3::unit_y();
-                            scene_center[ui_state.scene_camera as usize] -=
-                                cgmath::Vector3::unit_y();
-                        }
-                        VirtualKeyCode::D => {
-                            scene_position[ui_state.scene_camera as usize] +=
-                                cgmath::Vector3::unit_y();
-                            scene_center[ui_state.scene_camera as usize] +=
-                                cgmath::Vector3::unit_y();
-                        }
-                        VirtualKeyCode::Q => {
-                            scene_position[ui_state.scene_camera as usize] +=
-                                cgmath::Vector3::unit_z();
-                            scene_center[ui_state.scene_camera as usize] +=
-                                cgmath::Vector3::unit_z();
-                        }
-                        VirtualKeyCode::E => {
-                            scene_position[ui_state.scene_camera as usize] -=
-                                cgmath::Vector3::unit_z();
-                            scene_center[ui_state.scene_camera as usize] -=
-                                cgmath::Vector3::unit_z();
-                        }
-                        VirtualKeyCode::C => {
-                        }
-                        VirtualKeyCode::I => {}
-                        VirtualKeyCode::Escape => {
-                            *control_flow = ControlFlow::Exit;
-                        }
-                        _ => {}
-                    },
-                    WindowEvent::CloseRequested => {
+                } => match virtual_code {
+                    VirtualKeyCode::W => {
+                        scene_position[ui_state.scene_camera as usize] +=
+                            cgmath::Vector3::unit_x();
+                    }
+                    VirtualKeyCode::S => {
+                        scene_position[ui_state.scene_camera as usize] -=
+                            cgmath::Vector3::unit_x();
+                    }
+                    VirtualKeyCode::A => {
+                        scene_position[ui_state.scene_camera as usize] -=
+                            cgmath::Vector3::unit_y();
+                    }
+                    VirtualKeyCode::D => {
+                        scene_position[ui_state.scene_camera as usize] +=
+                            cgmath::Vector3::unit_y();
+                    }
+                    VirtualKeyCode::Q => {
+                        scene_position[ui_state.scene_camera as usize] +=
+                            cgmath::Vector3::unit_z();
+                    }
+                    VirtualKeyCode::E => {
+                        scene_position[ui_state.scene_camera as usize] -=
+                            cgmath::Vector3::unit_z();
+                    }
+                    VirtualKeyCode::C => {
+                    }
+                    VirtualKeyCode::I => {}
+                    VirtualKeyCode::Escape => {
                         *control_flow = ControlFlow::Exit;
                     }
                     _ => {}
                 },
-                Event::RedrawRequested(_) => {
-                    let now = Instant::now();
-                    imgui_context
-                        .io_mut()
-                        .update_delta_time(now - ui_state.last_frame);
-                    ui_state.last_frame = now;
-
-                    let frame = match swapchain.get_current_frame() {
-                        Ok(frame) => frame,
-                        Err(e) => {
-                            log::warn!("dropped frame: {:?}", e);
-                            swapchain = h.device.create_swap_chain(&h.surface, &swapchain_desc);
-                            swapchain
-                                .get_current_frame()
-                                .expect("Failed to acquire next swap chain texture!")
-                        }
-                    };
-
-                    update_camera_list(
-                        &h.queue,
-                        &mut scene_camera,
-                        &scene_camera_buffer,
-                        swapchain_extent,
-                        &scene_position,
-                        &scene_center,
-                        cgmath::Vector3::unit_x(),
-                        cgmath::Deg(90f32),
-                    );
-
-                    // Render Scene
-                    render(
-                        &scene_msaa_view,
-                        &frame.output.view,
-                        &h.device,
-                        &h.queue,
-                        &pipeline,
-                        &scene_bind_group,
-                        &vertex_buf,
-                        &index_buf,
-                        index_count,
-                        instance_data.read().unwrap().len(),
-                        PushConstant::new(0),
-                    );
-
-                    build_command_buffer_parallel(
-                        &mut cmd_buf_list,
-                        &eye_views,
-                        &capture_views,
-                        &h.device,
-                        &h.queue,
-                        &pipeline,
-                        &eye_bind_group,
-                        &vertex_buf,
-                        &index_buf,
-                        index_count,
-                        instance_data.read().unwrap().len(),
-                    );
-
-                    // Render eyes
-                    h.queue.submit(cmd_buf_list.drain(..));
-
-                    // Render viewport
-                    render(
-                        &viewport_view,
-                        imgui_renderer
-                            .textures
-                            .get(imgui_texture_id)
-                            .expect("failed to find imgui texture")
-                            .view(),
-                        &h.device,
-                        &h.queue,
-                        &pipeline,
-                        &eye_bind_group,
-                        &vertex_buf,
-                        &index_buf,
-                        index_count,
-                        instance_data.read().unwrap().len(),
-                        PushConstant::new(ui_state.viewport_camera),
-                    );
-
-                    log::info!("extent {:#?}", eye_extent);
-                    log::info!("dimension {:#?}", capture_dimension);
-                    capture(
-                        &h.device,
-                        &h.queue,
-                        &capture_texture,
-                        eye_extent,
-                        &capture_buffer,
-                        &capture_dimension,
-                    );
-
-                    // Render UI
-                    imgui_platform
-                        .prepare_frame(imgui_context.io_mut(), &window)
-                        .expect("Failed to prepare frame");
-
-                    let ui = imgui_context.frame();
-                    imgui_build_ui(&ui, &mut ui_state);
-                    imgui_draw_ui(
-                        &mut imgui_platform,
-                        &window,
-                        &h.device,
-                        &h.queue,
-                        &mut imgui_renderer,
-                        ui,
-                        &mut ui_state,
-                        &frame.output.view,
-                    );
+                WindowEvent::CloseRequested => {
+                    *control_flow = ControlFlow::Exit;
                 }
                 _ => {}
+            },
+            Event::RedrawRequested(_) => {
+                let now = Instant::now();
+                imgui_context
+                    .io_mut()
+                    .update_delta_time(now - ui_state.last_frame);
+                ui_state.last_frame = now;
+
+                let frame = match swapchain.get_current_frame() {
+                    Ok(frame) => frame,
+                    Err(e) => {
+                        log::warn!("dropped frame: {:?}", e);
+                        let size = window.inner_size();
+                        // store new extent to ui_state
+                        ui_state.extent = wgpu::Extent3d {
+                            width: size.width,
+                            height: size.height,
+                            depth: 1,
+                        };
+                        log::info!("Resizing to {:?}", size);
+                        // resize swapchain 
+                        swapchain_desc.width = size.width;
+                        swapchain_desc.height = size.height;
+                        swapchain = gpu.device.create_swap_chain(&surface, &swapchain_desc);
+                        // resize scene 
+                        scene_cam.resize(ui_state.extent);
+                        display.resize(&gpu.device, ui_state.extent);
+                        // try one last time to get swapchain frame 
+                        swapchain.get_current_frame().expect("failed to acquire swapchain frame")
+                    }
+                };
+
+                let inst = &mut *instance_data;
+                inst.into_par_iter()
+                    .zip(&mut velocities)
+                    .zip(&mut positions[..])
+                    .for_each(|((mat, vel), pos)| {
+                        let mut rng = rand::thread_rng();
+                        *vel += cgmath::Vector3::<f32>::new(
+                            rng.gen_range(-0.0001, 0.0001),
+                            rng.gen_range(-0.0001, 0.0001),
+                            0.0,
+                        );
+                        *pos += *vel;
+                        *mat = (
+                            cgmath::Matrix4::<f32>::from_translation(
+                                pos.to_vec(),
+                            ) * cgmath::Matrix4::from_angle_z(
+                                rotation_of(vel),
+                            )).into();
+                    });
+                gpu.queue.write_buffer(
+                    &instance_buf,
+                    0,
+                    bytemuck::cast_slice(inst.as_ref()),
+                );
+                
+                // Update cameras
+                eye_cams.update(&positions, &velocities);
+                scene_cam.update(&scene_position, &scene_look_dir);
+
+                eye_cams.write(&gpu.queue);
+                scene_cam.write(&gpu.queue);
+
+                // Render Scene
+                render(
+                    &display.views[0],
+                    &frame.output.view,
+                    &gpu.device,
+                    &gpu.queue,
+                    &pipeline,
+                    &scene_bind_group,
+                    &vertex_buf,
+                    &index_buf,
+                    index_count,
+                    instance_data.len(),
+                    PushConstant::new(0),
+                );
+
+                build_command_buffer_parallel(
+                    &mut cmd_buf_list,
+                    &eyes.views,
+                    &resolved_eyes.views,
+                    &gpu.device,
+                    &gpu.queue,
+                    &pipeline,
+                    &eye_bind_group,
+                    &vertex_buf,
+                    &index_buf,
+                    index_count,
+                    instance_data.len(),
+                );
+
+                // Render eyes
+                gpu.queue.submit(cmd_buf_list.drain(..));
+
+                // Render viewport
+                render(
+                    &viewport.views[0],
+                    imgui_renderer
+                        .textures
+                        .get(imgui_texture_id)
+                        .expect("failed to find imgui texture")
+                        .view(),
+                    &gpu.device,
+                    &gpu.queue,
+                    &pipeline,
+                    &eye_bind_group,
+                    &vertex_buf,
+                    &index_buf,
+                    index_count,
+                    instance_data.len(),
+                    PushConstant::new(ui_state.viewport_camera),
+                );
+
+                // Render UI
+                imgui_platform
+                    .prepare_frame(imgui_context.io_mut(), &window)
+                    .expect("Failed to prepare frame");
+
+                let ui = imgui_context.frame();
+                imgui_build_ui(&ui, &mut ui_state);
+                imgui_draw_ui(
+                    &mut imgui_platform,
+                    &window,
+                    &gpu.device,
+                    &gpu.queue,
+                    &mut imgui_renderer,
+                    ui,
+                    &mut ui_state,
+                    &frame.output.view,
+                );
             }
-            imgui_platform.handle_event(imgui_context.io_mut(), &window, &event);
-        });
-    })
-    .unwrap();
+            _ => {}
+        }
+        imgui_platform.handle_event(imgui_context.io_mut(), &window, &event);
+    });
 }
