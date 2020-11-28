@@ -118,14 +118,14 @@ impl ui::Implementation for NenbodyUi {
     }
 }
 
-/// a 2D model with mesh and texture data for drawing
-pub struct Model {
-    vertices: Vec<gfx::Vertex>,
-    indices: Vec<u16>,
-    texture: wgpu::Texture,
-    view: wgpu::TextureView,
-    sampler: wgpu::Sampler,
-}
+///// a 2D model with mesh and texture data for drawing
+//pub struct Model {
+//    vertices: Vec<gfx::Vertex>,
+//    indices: Vec<u16>,
+//    texture: wgpu::Texture,
+//    view: wgpu::TextureView,
+//    sampler: wgpu::Sampler,
+//}
 
 fn init_geometry_data() -> (Vec<gfx::Vertex>, Vec<u16>) {
     let vertex_data = [
@@ -404,23 +404,32 @@ fn update_instance_random(
 fn update_instance_boids(
     instances: &mut Vec<[[f32; 4]; 4]>,
     positions: &mut Vec<cgmath::Point3<f32>>,
-    velocities: &Vec<cgmath::Vector3<f32>>,
+    old_positions: &mut Vec<cgmath::Point3<f32>>,
+    velocities: &mut Vec<cgmath::Vector3<f32>>,
+    old_velocities: &mut Vec<cgmath::Vector3<f32>>,
 ) {
+    // copy current values into old first, to allow for nested, mutable iteration later
+    old_positions.copy_from_slice(positions.as_slice());
+    old_velocities.copy_from_slice(velocities.as_slice());
+    // all vectors should have same len
+    let length = instances.len();
+
     // compute boid rules
     // http://www.kfish.org/boids/pseudocode.html
-    let flock_deltas: Vec<cgmath::Vector3<f32>> = positions
-        .iter()
+    instances
+        .iter_mut()
+        .zip(positions)
         .zip(velocities)
         .enumerate()
-        .map(|(n, (boid_n_pos, boid_n_vel))| {
-            let flock_center = ((positions.iter().enumerate().fold(
+        .for_each(|(n, ((mat, boid_n_pos), boid_n_vel))| {
+            let flock_center = ((old_positions.iter().enumerate().fold(
                 cgmath::Vector3::new(0.0, 0.0, 0.0),
                 |sum, (i, boid_i_pos)| sum + (boid_i_pos.to_vec() * ((n != i) as u32 as f32)),
-            ) / (positions.len() as f32 - 1.0))
+            ) / (length as f32 - 1.0))
                 - boid_n_pos.to_vec())
                 / 100.0;
 
-            let flock_repel = positions.iter().enumerate().fold(
+            let flock_repel = old_positions.iter().enumerate().fold(
                 cgmath::Vector3::new(0.0, 0.0, 0.0),
                 |sum, (i, boid_i_pos)| {
                     sum - (boid_n_pos.to_vec()
@@ -430,31 +439,18 @@ fn update_instance_boids(
                 },
             );
 
-            let flock_match = ((velocities.iter().enumerate().fold(
+            let flock_match = ((old_velocities.iter().enumerate().fold(
                 cgmath::Vector3::new(0.0, 0.0, 0.0),
                 |sum, (i, boid_i_vel)| sum + (boid_i_vel * ((n != i) as u32 as f32)),
-            ) / ((velocities.len() - 1) as f32))
+            ) / ((length - 1) as f32))
                 - boid_n_vel.clone())
                 / 8.0;
 
-            boid_n_vel.clone() + flock_center + flock_repel + flock_match
-        })
-        .collect();
-
-    instances
-        .into_par_iter()
-        .zip(velocities)
-        .zip(positions)
-        .for_each(|((mat, vel), pos)| {
-            let mut rng = rand::thread_rng();
-            *vel += cgmath::Vector3::<f32>::new(
-                rng.gen_range(-0.0001, 0.0001),
-                rng.gen_range(-0.0001, 0.0001),
-                0.0,
-            );
-            *pos += *vel;
-            *mat = (cgmath::Matrix4::<f32>::from_translation(pos.to_vec())
-                * cgmath::Matrix4::from_angle_z(rotation_of(vel)))
+            *boid_n_vel = (*boid_n_vel + flock_center + flock_repel + flock_match) / 100.0;
+            // need new clone of update vel
+            *boid_n_pos = cgmath::Point3::from_vec(boid_n_vel.clone() + boid_n_pos.to_vec());
+            *mat = (cgmath::Matrix4::<f32>::from_translation(boid_n_pos.to_vec())
+                * cgmath::Matrix4::from_angle_z(rotation_of(boid_n_vel)))
             .into();
         });
 }
@@ -673,6 +669,9 @@ fn main() {
             cgmath::Point3::<f32>::new(rng.gen_range(-1.0, 1.0), rng.gen_range(-1.0, 1.0), 0.0)
         })
         .collect();
+    // extra storage for update functions
+    let mut old_positions = positions.clone();
+    let mut old_velocities = velocities.clone();
 
     // Cameras
     // scene_camera
@@ -848,24 +847,9 @@ fn main() {
                     }
                 };
 
-                let inst = &mut *instance_data;
-                inst.into_par_iter()
-                    .zip(&mut velocities)
-                    .zip(&mut positions[..])
-                    .for_each(|((mat, vel), pos)| {
-                        let mut rng = rand::thread_rng();
-                        *vel += cgmath::Vector3::<f32>::new(
-                            rng.gen_range(-0.0001, 0.0001),
-                            rng.gen_range(-0.0001, 0.0001),
-                            0.0,
-                        );
-                        *pos += *vel;
-                        *mat = (cgmath::Matrix4::<f32>::from_translation(pos.to_vec())
-                            * cgmath::Matrix4::from_angle_z(rotation_of(vel)))
-                        .into();
-                    });
+                update_instance_boids(&mut instance_data, &mut positions, &mut old_positions, &mut velocities, &mut old_velocities);
                 gpu.queue
-                    .write_buffer(&instance_buf, 0, bytemuck::cast_slice(inst.as_ref()));
+                    .write_buffer(&instance_buf, 0, bytemuck::cast_slice(instance_data.as_ref()));
 
                 // Update cameras
                 eye_cams.update(&positions, &velocities);
