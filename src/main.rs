@@ -401,6 +401,45 @@ fn update_instance_random(
         });
 }
 
+fn update_instance_nbody(
+    instances: &mut Vec<[[f32; 4]; 4]>,
+    positions: &mut Vec<cgmath::Point3<f32>>,
+    old_positions: &mut Vec<cgmath::Point3<f32>>,
+    velocities: &mut Vec<cgmath::Vector3<f32>>,
+    old_velocities: &mut Vec<cgmath::Vector3<f32>>,
+) {
+    let dt = 0.1;
+    let G = 0.001;
+    let bias = 0.0000001;
+    // copy current values into old first, to allow for nested, mutable iteration later
+    old_positions.copy_from_slice(positions.as_slice());
+    old_velocities.copy_from_slice(velocities.as_slice());
+
+    // compute nbody rules
+    // http://www.cs.hut.fi/~ctl/NBody.pdf
+    instances
+        .par_iter_mut()
+        .zip(positions)
+        .zip(velocities)
+        .for_each(|((mat, boid_n_pos), boid_n_vel)| {
+            let gravity = old_positions.iter().fold(
+                cgmath::Vector3::new(0.0, 0.0, 0.0),
+                |sum, boid_i_pos| {
+                    let vec = boid_i_pos.to_vec() - boid_n_pos.to_vec();
+                    let dist = boid_n_pos.distance2(*boid_i_pos) + bias;
+                    sum + (vec * G / dist)
+                },
+            );
+
+            *boid_n_vel = *boid_n_vel + gravity * dt;
+            // need new clone of update vel
+            *boid_n_pos = cgmath::Point3::from_vec(boid_n_vel.clone() + boid_n_pos.to_vec());
+            *mat = (cgmath::Matrix4::<f32>::from_translation(boid_n_pos.to_vec())
+                * cgmath::Matrix4::from_angle_z(rotation_of(boid_n_vel)))
+            .into();
+        });
+}
+
 fn update_instance_boids(
     instances: &mut Vec<[[f32; 4]; 4]>,
     positions: &mut Vec<cgmath::Point3<f32>>,
@@ -408,47 +447,78 @@ fn update_instance_boids(
     velocities: &mut Vec<cgmath::Vector3<f32>>,
     old_velocities: &mut Vec<cgmath::Vector3<f32>>,
 ) {
+    let dt = 0.04;
+    let rule_1_distance = 1000.0;
+    let rule_2_distance = 5.0;
+    let rule_3_distance = 500.0;
+    let rule_1_scale = 0.02;
+    let rule_2_scale = 0.05;
+    let rule_3_scale = 0.5;
+
     // copy current values into old first, to allow for nested, mutable iteration later
     old_positions.copy_from_slice(positions.as_slice());
     old_velocities.copy_from_slice(velocities.as_slice());
     // all vectors should have same len
-    let length = instances.len();
 
     // compute boid rules
     // http://www.kfish.org/boids/pseudocode.html
     instances
-        .iter_mut()
+        .par_iter_mut()
         .zip(positions)
         .zip(velocities)
         .enumerate()
         .for_each(|(n, ((mat, boid_n_pos), boid_n_vel))| {
-            let flock_center = ((old_positions.iter().enumerate().fold(
-                cgmath::Vector3::new(0.0, 0.0, 0.0),
-                |sum, (i, boid_i_pos)| sum + (boid_i_pos.to_vec() * ((n != i) as u32 as f32)),
-            ) / (length as f32 - 1.0))
-                - boid_n_pos.to_vec())
-                / 100.0;
+            let (mut flock_center, count) = old_positions.iter().enumerate().fold(
+                (cgmath::Vector3::new(0.0, 0.0, 0.0), 0),
+                |(sum, cnt), (i, boid_i_pos)| {
+                    let dist = boid_n_pos.distance2(*boid_i_pos);
+                    if dist < rule_1_distance && n != i {
+                        (sum + boid_i_pos.to_vec(), cnt + 1)
+                    } else {
+                        (sum, cnt)
+                    }
+                });
 
             let flock_repel = old_positions.iter().enumerate().fold(
                 cgmath::Vector3::new(0.0, 0.0, 0.0),
                 |sum, (i, boid_i_pos)| {
-                    sum - (boid_n_pos.to_vec()
-                        - (boid_i_pos.to_vec()
-                            * (n != i) as u32 as f32
-                            * (boid_n_pos.distance2(*boid_i_pos).abs() > 100.0) as u32 as f32))
+                    let dist = boid_n_pos.distance(*boid_i_pos);   
+                    if dist < rule_2_distance && n != i {
+                        sum - (boid_i_pos.to_vec() - boid_n_pos.to_vec())
+                    } else {
+                        sum
+                    }
                 },
             );
 
-            let flock_match = ((old_velocities.iter().enumerate().fold(
-                cgmath::Vector3::new(0.0, 0.0, 0.0),
-                |sum, (i, boid_i_vel)| sum + (boid_i_vel * ((n != i) as u32 as f32)),
-            ) / ((length - 1) as f32))
-                - boid_n_vel.clone())
-                / 8.0;
+            let (mut flock_match, vcount) = old_velocities.iter().enumerate().fold(
+                (cgmath::Vector3::new(0.0, 0.0, 0.0), 0),
+                |(sum, cnt), (i, boid_i_vel)| {
+                    let dist = boid_n_vel.distance(*boid_i_vel);   
+                    if dist < rule_3_distance && n != i {
+                        (sum + boid_i_vel, cnt + 1)
+                    } else {
+                        (sum, cnt)
+                    }
+                },
+            );
 
-            *boid_n_vel = (*boid_n_vel + flock_center + flock_repel + flock_match) / 100.0;
-            // need new clone of update vel
-            *boid_n_pos = cgmath::Point3::from_vec(boid_n_vel.clone() + boid_n_pos.to_vec());
+            if count > 0 {
+                flock_center = flock_center / count as f32;
+            }
+
+            if vcount > 0 {
+                flock_match = flock_match / vcount as f32;
+            }
+
+            *boid_n_vel = flock_center * rule_1_scale + flock_repel * rule_2_scale + flock_match * rule_3_scale;
+
+            if boid_n_vel.magnitude() > 1.0 {
+                *boid_n_vel = boid_n_vel.normalize_to(1.0)
+            }
+
+             //need new clone of update vel
+            *boid_n_pos = cgmath::Point3::from_vec(boid_n_vel.clone() * dt + boid_n_pos.to_vec());
             *mat = (cgmath::Matrix4::<f32>::from_translation(boid_n_pos.to_vec())
                 * cgmath::Matrix4::from_angle_z(rotation_of(boid_n_vel)))
             .into();
@@ -581,12 +651,15 @@ fn main() {
     // TODO: Get max allowed msaa_samples and store in GPU handle
     let msaa_samples = 8;
     // TODO: Support entity counts higher than 2048
-    let entity_count = 10;
+    let entity_count = 2048;
 
     // Window
     env_logger::init();
     let event_loop = EventLoop::new();
-    let window = WindowBuilder::new().build(&event_loop).unwrap();
+    let window = WindowBuilder::new()
+        .with_inner_size(winit::dpi::PhysicalSize::new(1920, 1080))
+        .build(&event_loop)
+        .unwrap();
 
     // GPU and surface
     let (gpu, surface) = gfx::Gpu::new(&window);
@@ -662,11 +735,14 @@ fn main() {
 
     // Placeholder position and velocity generation
     let mut rng = rand::thread_rng();
-    let mut velocities: Vec<cgmath::Vector3<f32>> =
-        vec![cgmath::Vector3::<f32>::new(0.0, 0.0, 0.0); entity_count];
+    let mut velocities: Vec<cgmath::Vector3<f32>> = (0..entity_count)
+        .map(|_| {
+            cgmath::Vector3::<f32>::new(rng.gen_range(-0.0, 0.1), rng.gen_range(-0.0, 0.1), 0.0)
+        })
+        .collect();
     let mut positions: Vec<cgmath::Point3<f32>> = (0..entity_count)
         .map(|_| {
-            cgmath::Point3::<f32>::new(rng.gen_range(-1.0, 1.0), rng.gen_range(-1.0, 1.0), 0.0)
+            cgmath::Point3::<f32>::new(rng.gen_range(-100.0, 100.0), rng.gen_range(-100.0, 100.0), 0.0)
         })
         .collect();
     // extra storage for update functions
@@ -675,7 +751,7 @@ fn main() {
 
     // Cameras
     // scene_camera
-    let mut scene_position = vec![cgmath::Point3::<f32>::new(0.0, 0.0, 100.0); 1];
+    let mut scene_position = vec![cgmath::Point3::<f32>::new(0.0, 0.0, 990.0); 1];
     let scene_look_dir = vec![-cgmath::Vector3::unit_z(); 1];
     let mut scene_cam = gfx::CameraArray::new(
         &gpu.device,
@@ -758,7 +834,6 @@ fn main() {
 
     let mut last_update_inst = std::time::Instant::now();
     event_loop.run(move |event, _, control_flow| {
-        // Set control flow to wait min(next event, 10ms)
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(1));
 
         // Process events
@@ -800,12 +875,12 @@ fn main() {
                         },
                     ..
                 } => match virtual_code {
-                    VirtualKeyCode::W => scene_position[0] += cgmath::Vector3::unit_x(),
-                    VirtualKeyCode::S => scene_position[0] -= cgmath::Vector3::unit_x(),
-                    VirtualKeyCode::A => scene_position[0] -= cgmath::Vector3::unit_y(),
-                    VirtualKeyCode::D => scene_position[0] += cgmath::Vector3::unit_y(),
-                    VirtualKeyCode::Q => scene_position[0] += cgmath::Vector3::unit_z(),
-                    VirtualKeyCode::E => scene_position[0] -= cgmath::Vector3::unit_z(),
+                    VirtualKeyCode::W => scene_position[0] += 10f32 * cgmath::Vector3::unit_x(),
+                    VirtualKeyCode::S => scene_position[0] -= 10f32 * cgmath::Vector3::unit_x(),
+                    VirtualKeyCode::A => scene_position[0] -= 10f32 * cgmath::Vector3::unit_y(),
+                    VirtualKeyCode::D => scene_position[0] += 10f32 * cgmath::Vector3::unit_y(),
+                    VirtualKeyCode::Q => scene_position[0] += 10f32 * cgmath::Vector3::unit_z(),
+                    VirtualKeyCode::E => scene_position[0] -= 10f32 * cgmath::Vector3::unit_z(),
                     VirtualKeyCode::Escape => *control_flow = ControlFlow::Exit,
                     _ => {}
                 },
@@ -847,9 +922,18 @@ fn main() {
                     }
                 };
 
-                update_instance_boids(&mut instance_data, &mut positions, &mut old_positions, &mut velocities, &mut old_velocities);
-                gpu.queue
-                    .write_buffer(&instance_buf, 0, bytemuck::cast_slice(instance_data.as_ref()));
+                update_instance_boids(
+                    &mut instance_data,
+                    &mut positions,
+                    &mut old_positions,
+                    &mut velocities,
+                    &mut old_velocities,
+                );
+                gpu.queue.write_buffer(
+                    &instance_buf,
+                    0,
+                    bytemuck::cast_slice(instance_data.as_ref()),
+                );
 
                 // Update cameras
                 eye_cams.update(&positions, &velocities);

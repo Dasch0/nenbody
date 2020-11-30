@@ -362,7 +362,7 @@ impl CameraArray {
         up: cgmath::Vector3<f32>,
         vertical_fov: cgmath::Deg<f32>,
     ) -> [[f32; 4]; 4] {
-        let proj = cgmath::perspective(vertical_fov, aspect_ratio, 1.0, 1000.0);
+        let proj = cgmath::perspective(vertical_fov, aspect_ratio, 1.0, 10000.0);
         let view = cgmath::Matrix4::look_at_dir(eye, center, up);
         let correction = OPENGL_TO_WGPU_MATRIX;
         (correction * proj * view).into()
