@@ -62,7 +62,7 @@ impl ui::Implementation for NenbodyUi {
     }
 
     fn update(&mut self, ui: &mut imgui::Ui) {
-        let imgui_window = imgui::Window::new(im_str!("Learning WGPU"));
+        let imgui_window = imgui::Window::new(im_str!("Nenbody"));
         imgui_window
             .size([500.0, 500.0], imgui::Condition::FirstUseEver)
             .build(ui, || {
@@ -651,7 +651,7 @@ fn main() {
     // TODO: Get max allowed msaa_samples and store in GPU handle
     let msaa_samples = 8;
     // TODO: Support entity counts higher than 2048
-    let entity_count = 2048;
+    let entity_count = 100;
 
     // Window
     env_logger::init();
@@ -937,6 +937,8 @@ fn main() {
 
                 // Update cameras
                 eye_cams.update(&positions, &velocities);
+                scene_position[0].x = positions[0].x;
+                scene_position[0].y = positions[0].y;
                 scene_cam.update(&scene_position, &scene_look_dir);
 
                 eye_cams.write(&gpu.queue);
