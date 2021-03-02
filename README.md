@@ -6,9 +6,9 @@ Nenbody is intended to be a multi-agent 2d simulation for simple control algorit
 ## Background
 This repository is a continuation of work from both [nenserver](https://github.com/Dasch0/nenserver) and [nenclient](https://github.com/Dasch0/nenclient), originally started in C++ and python. Demos of the work done in those repos are below:
 
-[Acceleration and landing](https://www.youtube.com/watch?v=I9AHZ5UcHEc)
-[Error based control](https://www.youtube.com/watch?v=ouFYhsppqWI)
-[Neural Control With Inhibitors](https://www.youtube.com/watch?v=WhXmLyYfXIs)
+* [Acceleration and landing](https://www.youtube.com/watch?v=I9AHZ5UcHEc)
+* [Error based control](https://www.youtube.com/watch?v=ouFYhsppqWI)
+* [Neural Control With Inhibitors](https://www.youtube.com/watch?v=WhXmLyYfXIs)
 
 
 ## Demos
